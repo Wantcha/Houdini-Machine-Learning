@@ -1,0 +1,1 @@
+python -m tf2onnx.convert --saved-model graph_model --output model.onnx --opset 9
