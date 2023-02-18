@@ -296,6 +296,12 @@ class Attribute:
                 _Assert(self.Array and self.TupleSize == 1,
                         "Expected a single value")
                 self.Array = self.Array[0]
+
+        elif self.Type == 'arraydata':
+            self.Array = obj["values"]
+            self.Storage = obj.get("storage", "int32")
+            self.TupleSize = obj.get("size")
+
         else:
             # Unknown attribute type, so just store the entire attribute value
             # block
@@ -751,7 +757,10 @@ def primRun(pdata):
         primlist.append(primLoaders.get(ptype, loadUnknown)(ptype, data))
     return primlist
     '''
-    return pdata['startvertex'], pdata['nprimitives'], _unpackPrimRLE(pdata['nvertices_rle']), pdata['nvertices_rle']
+    if 'nvertices_rle' in pdata:
+        return pdata['startvertex'], pdata['nprimitives'], _unpackPrimRLE(pdata['nvertices_rle']), pdata['nvertices_rle']
+    else:
+        return pdata['startvertex'], pdata['nprimitives'], pdata['nvertices'], None
 
 
 class Detail:

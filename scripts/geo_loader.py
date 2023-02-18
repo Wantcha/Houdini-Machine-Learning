@@ -7,6 +7,7 @@ import torch as th
 import torch_geometric.data as tgd
 import collections
 import os
+import time
 
 abspath = os.path.abspath(__file__)
 dname = os.path.dirname(abspath)
@@ -14,86 +15,118 @@ os.chdir(dname)
 
 Stats = collections.namedtuple("Stats", ["mean", "std"])
 
-VELOCITY_STATS = Stats(
-    mean=np.zeros([3], dtype=np.float32),
-    std=np.ones([3], dtype=np.float32))
+device = th.device('cuda' if th.cuda.is_available() else 'cpu')
+
+'''VELOCITY_STATS = Stats(
+    mean = th.zeros([3]).to(device),
+    std = th.ones([3]).to(device))'''
 ACCELERATION_STATS = Stats(
-    mean=np.zeros([3], dtype=np.float32),
-    std=np.ones([3], dtype=np.float32))
+    mean = th.zeros([3]),
+    std = th.ones([3]))
 
-def encodePreprocess(input_position_sequence : th.Tensor, mesh: hgeo.Detail) -> tgd.Data:
-    point_positions = input_position_sequence[-1]
+EdgeSet = collections.namedtuple('EdgeSet', ['name', 'features', 'senders',
+                                             'receivers'])
+MultiGraph = collections.namedtuple('Graph', ['node_features', 'edge_sets'])
 
-    velocity_sequence = input_position_sequence[1:] - input_position_sequence[:-1]
-    normalized_velocity_sequence = (velocity_sequence - VELOCITY_STATS.mean) / VELOCITY_STATS.std
 
-    normalized_velocity_sequence = normalized_velocity_sequence.permute(1, 0, 2) # shape should now be (npoints, seq_length, dimensions)
-    normalized_velocity_sequence = normalized_velocity_sequence.contiguous().view(normalized_velocity_sequence.shape[0], -1) # shape should now be (npoints, features)
-    # print('size of normalized velocity sequence:')
-    # print(normalized_velocity_sequence.size())
+def encodePreprocess(input_position_sequence : th.Tensor, mesh: hgeo.Detail, point_types: th.Tensor, vertex_radius = 0.5) -> tgd.Data:
+    point_positions = input_position_sequence[:, -1]
 
-    sourceNodes = []
-    destNodes = []
-    edgeLengths = []
-    edgeDisplacements = []
+    velocity_sequence = time_diff(input_position_sequence).to(device)
+    #normalized_velocity_sequence = (velocity_sequence - VELOCITY_STATS.mean) / VELOCITY_STATS.std
+
+    velocity_sequence = velocity_sequence.contiguous().view(velocity_sequence.shape[0], -1) # shape should now be (npoints, features)
+    total_point_types = 2
+    node_types = th.nn.functional.one_hot(point_types.long(), total_point_types).to(device)
+    node_features = th.cat([velocity_sequence, node_types], dim=-1)
+    mesh_edges = {}
+
+    mesh_sourceNodes = []
+    mesh_destNodes = []
     
     for p in mesh.Primitives:
         for i in range(1, len(p.Vertices)):
             p1 = mesh.vertexPoint(p.Vertices[i-1])
             p2 = mesh.vertexPoint(p.Vertices[i])
-            sourceNodes.extend( (p1, p2) )
-            destNodes.extend( (p2, p1) )
-            #sourceNodes.append(p1)
-            #destNodes.append(p2) #
-            #sourceNodes.append(p2)
-            #destNodes.append(p1)
-            displacement = point_positions[p2] - point_positions[p1]
-            edgeDisplacements.extend( (displacement, displacement) )
-            l = th.tensor(np.linalg.norm( displacement ), dtype=th.float32) # edge length
-            edgeLengths.extend( (l, l) )
+
+            if (p1, p2) not in mesh_edges:
+                mesh_edges[(p1, p2)] = True
+                mesh_edges[(p2, p1)] = True
+
+                mesh_sourceNodes.extend( (p1, p2) )
+                mesh_destNodes.extend( (p2, p1) )
 
         p1 = mesh.vertexPoint(p.Vertices[len(p.Vertices) - 1])
         p2 = mesh.vertexPoint(p.Vertices[0])
-        sourceNodes.extend( (p1, p2) )
-        destNodes.extend( (p2, p1) )
-        #sourceNodes.append(p1)
-        #destNodes.append(p2) #
-        #sourceNodes.append(p2)
-        #destNodes.append(p1)
-        displacement = point_positions[p2] - point_positions[p1]
-        edgeDisplacements.extend( (displacement, displacement) )
-        l = th.tensor(np.linalg.norm( displacement ), dtype=th.float32)
-        edgeLengths.extend( (l, l) )
 
-    edge_index = th.tensor([sourceNodes, destNodes], dtype=th.long)
+        if (p1, p2) not in mesh_edges:
+            mesh_edges[(p1, p2)] = True
+            mesh_edges[(p2, p1)] = True
 
+            mesh_sourceNodes.extend( (p1, p2) )
+            mesh_destNodes.extend( (p2, p1) )
+
+    #edge_index = th.tensor([mesh_sourceNodes, mesh_destNodes], dtype=th.long)
+    pattributes_dict = mesh.PointAttributes
+    rest_positions = th.tensor(pattributes_dict['rest'].Array)
+    #print(rest_positions)
     
-    #g.ndata['Feats'] = normalized_velocity_sequence
-    #g.ndata['Type'] = th.tensor(pinned_points, dtype=th.float32) # 1-Free; 2-Pinned
-    #g.edata['Feats'] = th.tensor(edgeLengths, dtype=th.float32)
-    edgeDisplacements = th.stack(edgeDisplacements)
-    edgeLengths = th.stack(edgeLengths)
+    relative_world_displacements = point_positions[mesh_sourceNodes, :] - point_positions[mesh_destNodes, :]
+    relative_world_distances = th.norm(relative_world_displacements, dim=-1, keepdim=True)
+
+    relative_rest_displacements = rest_positions[mesh_sourceNodes, :] - rest_positions[mesh_destNodes, :]
+    relative_rest_distances = th.norm(relative_world_displacements, dim=-1, keepdim=True)
+
+    mesh_edge_features = [relative_rest_displacements, relative_rest_distances, relative_world_displacements, relative_world_distances]
+    mesh_edge_features = th.cat(mesh_edge_features, dim = -1)
+
+    world_sourceNodes = []
+    world_destNodes = []
+    world_edge_features = []
+    world_edges = {}
     
-    edge_attr = th.cat((edgeDisplacements, edgeLengths.unsqueeze(-1)), 1)
+    proximity_points = pattributes_dict['close_points'].Array
+    for i in range(len(proximity_points)):
+        close_pts = proximity_points[i]
+        if len(close_pts):
+            for point in close_pts:
+                if (i, point) not in world_edges:
+                    world_edges[(i, point)] = True
+                    world_edges[(point, i)] = True
 
-    if (len(edge_attr.shape) == 1):
-            adjustedfeats = []
-            for i in range(edge_attr.shape[0]):
-                adjustedfeats.append( edge_attr[i].unsqueeze(dim=0) )
-            edge_attr = th.stack(adjustedfeats)
+                    world_sourceNodes.extend ( (i, point) )
+                    world_destNodes.extend ( (point, i) )
 
-    g = tgd.Data(x=normalized_velocity_sequence, edge_index=edge_index, edge_attr=edge_attr)
+    world_displacements = point_positions[world_sourceNodes, :] - point_positions[world_destNodes, :]
+    world_edge_features.append(world_displacements)
+
+    world_distances = th.norm(world_displacements, dim=-1, keepdim=True)
+    world_edge_features.append(world_distances)
+
+    world_edge_features = th.cat(world_edge_features, dim = -1)
+
+
+    #g = tgd.Data(x=node_features, edge_index=edge_index, edge_attr=edge_features)
+    g = tgd.HeteroData()
+    g["point"].x = node_features
+    g["point", "mesh", "point"].edge_index = th.tensor([mesh_sourceNodes, mesh_destNodes], dtype=th.long)
+    g["point", "mesh", "point"].edge_attr = mesh_edge_features
+    g["point", "world", "point"].edge_index = th.tensor([world_sourceNodes, world_destNodes], dtype=th.long)
+    g["point", "world", "point"].edge_attr = world_edge_features
     return g
+
+
+def time_diff(input_sequence):
+    return input_sequence[:, 1:] - input_sequence[:, :-1]
 
 
 def calculate_noisy_velocities(positions: th.Tensor, sampled_noise):
     noisy_positions = positions + sampled_noise
     
-    velocity_sequence = noisy_positions[1:] - noisy_positions[:-1]
-    normalized_velocity_sequence = (velocity_sequence - VELOCITY_STATS.mean) / VELOCITY_STATS.std
+    velocity_sequence = time_diff(noisy_positions)
+    #normalized_velocity_sequence = (velocity_sequence.to('cuda') - VELOCITY_STATS.mean) / VELOCITY_STATS.std
 
-    normalized_velocity_sequence = normalized_velocity_sequence.permute(1, 0, 2) # shape should now be (npoints, seq_length, dimensions)
-    normalized_velocity_sequence = normalized_velocity_sequence.contiguous().view(normalized_velocity_sequence.shape[0], -1) # shape should now be (npoints, features)
+    normalized_velocity_sequence = velocity_sequence.contiguous().view(velocity_sequence.shape[0], -1) # shape should now be (npoints, features)
 
     return normalized_velocity_sequence
 
@@ -101,7 +134,7 @@ def calculate_noisy_velocities(positions: th.Tensor, sampled_noise):
 def get_random_walk_noise_for_position_sequence(position_sequence : th.Tensor, noise_std_last_step):
     """Returns random-walk noise in the velocity applied to the position."""
 
-    velocity_sequence = position_sequence[1:] - position_sequence[:-1]
+    velocity_sequence = time_diff(position_sequence)
 
     # We want the noise scale in the velocity at the last step to be fixed.
     # Because we are going to compose noise at each step using a random_walk:
@@ -121,9 +154,9 @@ def get_random_walk_noise_for_position_sequence(position_sequence : th.Tensor, n
     # an Euler intergrator and a dt = 1, and adding no noise to the very first
     # position (since that will only be used to calculate the first position
     # change).
-    position_sequence_noise = th.concat([ th.zeros_like(velocity_sequence_noise[0:1,:,:]),
-                                           th.cumsum(velocity_sequence_noise, dim=1)], dim=0)
-
+    position_sequence_noise = th.concat([ th.zeros_like(velocity_sequence_noise[:, 0:1]),
+                                           th.cumsum(velocity_sequence_noise, dim=1)], dim=1)
+    
     return position_sequence_noise
 
 class GeometrySequence(NamedTuple):
@@ -136,6 +169,7 @@ class GeometrySequence(NamedTuple):
 def load_detail(filepath: str) -> hgeo.Detail:
     with open(filepath, 'r') as f:
         mesh = hgeo.Detail()
+        #print(filepath)
         mesh.loadJSON(hjson.load(f))
     return mesh
 
@@ -144,7 +178,6 @@ def load_geometry_sequence(filepath: str, base_name: str, start_frame: int, sequ
 
     for b in range(start_frame, start_frame + sequence_length - 1):
         mesh = load_detail(f"{filepath}\\{base_name}.{b}.geo")
-        # npoints = mesh.pointCount
         pattributes_dict = mesh.PointAttributes
         position_sequence.append(th.tensor(pattributes_dict['P'].Array, dtype=th.float32))
     
@@ -163,9 +196,10 @@ def load_geometry_sequence(filepath: str, base_name: str, start_frame: int, sequ
         pinned_points = th.zeros(npoints, dtype=th.int32)
 
     positions_tensor = th.stack(position_sequence)
+    positions_tensor = positions_tensor.permute(1, 0, 2) # shape should now be (npoints, seq_length, dimensions)
 
-    input_position_sequence = positions_tensor[:-1]
-    target_position = positions_tensor[-1]
+    input_position_sequence = positions_tensor[:, :-1]
+    target_position = positions_tensor[:, -1]
 
     return GeometrySequence(input_position_sequence, target_position, npoints, pinned_points, mesh)
 
