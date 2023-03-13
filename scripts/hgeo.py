@@ -351,6 +351,12 @@ class Attribute:
                     "storage", "int32",
                     kword, self.Array ]
             ]
+        elif self.Type == 'arraydata':
+            avalue += [ 'storage', self.Storage ]
+            avalue += [
+                "values", self.Array
+                    ]
+
         else:
             avalue += self.Array
         return [ adef, avalue ]
